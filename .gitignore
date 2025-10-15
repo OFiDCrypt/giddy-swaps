@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Env/Secrets
+.env
+*.env
+
+# Logs
+swaps/
+*.log
+
+# OS/Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Keypairs (user-provided)
+*.json  # Or specific: mint-authority.json
+
+# Builds/Tests
+dist/
+build/
+*.test.js

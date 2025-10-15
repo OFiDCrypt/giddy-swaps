@@ -1,0 +1,31 @@
+{
+  "name": "giddy_swap_bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@jup-ag/api": "^6.0.44",
+    "@jup-ag/plugin": "^1.0.7",
+    "@meteora-ag/dlmm": "^1.7.5",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "axios": "^1.12.2",
+    "bn.js": "^5.2.2",
+    "bs58": "^6.0.0",
+    "dotenv": "^17.2.3",
+    "node-cron": "^4.2.1",
+    "node-fetch": "^3.3.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "request": "^2.88.2",
+    "request-promise": "^4.2.6",
+    "request-promise-core": "^1.1.4"
+  }
+}
