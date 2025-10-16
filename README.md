@@ -3,7 +3,7 @@
 **Version**: 1.0.0  
 **Author**: OFiDCrypt ([@OFiDCrypt](https://github.com/OFiDCrypt))  
 **Telegram Bot Handle**: [@Giddy_Swap_Bot](https://t.me/Giddy_Swap_Bot)  
-**Repository**: [Private - Contact @OFiDCrypt for access](https://github.com/OFiDCrypt/giddy-swaps)  
+**Repository**: [Public - Contributors Contact @OFiDCrypt for support](https://github.com/OFiDCrypt/giddy-swaps)  
 **License**: MIT (with attribution to OFiDCrypt)  
 **Date**: October 15, 2025
 
