@@ -182,9 +182,9 @@ From `package.json`:
 - **Errors**: Share error logs with `@OFiDCrypt` for support.
 
 ## Contributing
-This is a private project. To contribute:
-- Fork and submit PRs to `@OFiDCrypt`.
+This is a public project:
+- Fork the repo, submit contributions.
 - Focus areas: Multi-token support, analytics dashboard, cross-chain volume.
-- Contact `@OFiDCrypt` on Telegram or X for access or support.
+- Contact `@OFiDCrypt` on Telegram or X for support.
 
 Happy swapping!
