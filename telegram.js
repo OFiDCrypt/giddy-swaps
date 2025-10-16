@@ -12,7 +12,18 @@ import {
 
 dotenv.config();
 
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: { interval: 2000, autoStart: true } });
+
+// Handle polling errors to prevent crashes
+bot.on('polling_error', (error) => {
+  console.error(`❌ Polling error: ${JSON.stringify(error)}`);
+  // Attempt to restart polling after a delay
+  setTimeout(() => {
+    console.log('🔄 Attempting to restart polling...');
+    bot.startPolling({ restart: true });
+  }, 5000);
+});
+
 const connection = new Connection(process.env.RPC_URL, 'confirmed');
 
 let isSwapping = false;
@@ -32,6 +43,7 @@ const menu = {
 
 let swapLog = [];
 let trackedGiddyDelta = 0;
+let lastSwapOutAmount = 0; // Track the last swap's output amount
 
 async function decodeSwap(txid, chatId) {
   try {
@@ -74,20 +86,32 @@ async function waitForBalanceChange(mint, preBalance, direction, chatId, quote) 
   let postBalance = preBalance;
   const maxAttempts = 10; // 20 seconds
   let attempts = 0;
+  const tokenLabel = mint.equals(GIDDY_MINT) ? 'GIDDY' : 'USDC';
   while (postBalance === preBalance && attempts < maxAttempts) {
     await new Promise(r => setTimeout(r, 2000));
     const balances = await getBalances();
     postBalance = mint.equals(GIDDY_MINT) ? balances.giddy : balances.usdc;
     attempts++;
-    console.log(`Attempt ${attempts}: Waiting for ${direction.label} balance change... Current: ${postBalance.toFixed(2)}`);
+    console.log(`Attempt ${attempts}: Waiting for ${tokenLabel} balance change after ${direction.label}... Current: ${postBalance.toFixed(2)}`);
   }
+  const stopMessage = `🔄 Swaps in progress ♻️`;
   if (postBalance === preBalance) {
     const outAmount = (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS;
-    const warnMsg = `⚠️ Balance did not change after ${direction.label} swap after ${maxAttempts} attempts. Using quote amount: ${outAmount.toFixed(2)}`;
-    await bot.sendMessage(chatId, warnMsg);
-    console.log(warnMsg);
+    console.log(`⚠️ ${tokenLabel} balance did not change after ${direction.label} swap after ${maxAttempts} attempts. Using quote amount: ${outAmount.toFixed(2)}`);
+    console.log(stopMessage);
+    await bot.sendMessage(chatId, stopMessage, {
+      reply_markup: {
+        inline_keyboard: [[{ text: "Stop", callback_data: "stop" }]],
+      },
+    });
     return outAmount; // Fallback to quote
   }
+  console.log(stopMessage);
+  await bot.sendMessage(chatId, stopMessage, {
+    reply_markup: {
+      inline_keyboard: [[{ text: "Stop", callback_data: "stop" }]],
+    },
+  });
   return postBalance;
 }
 
@@ -115,17 +139,17 @@ bot.onText(/\/swap/, async (msg) => {
   let preBalance = balances.giddy;
   if (direction.from.equals(USDC_MINT)) {
     const maxBuy = Number(process.env.MAX_BUY_USDC || 10) * DECIMALS;
-    amount = Math.min(inputBal * DECIMALS, maxBuy);
+    amount = lastSwapOutAmount > 0 ? Math.min(lastSwapOutAmount * DECIMALS, maxBuy) : Math.min(inputBal * DECIMALS, maxBuy);
     if (amount < Number(process.env.MIN_SWAP_AMOUNT) * DECIMALS) {
       await bot.sendMessage(chatId, `🛑 Insufficient USDC for buy: ${inputBal.toFixed(2)} (min ${process.env.MIN_SWAP_AMOUNT})`);
       return;
     }
   } else {
-    if (trackedGiddyDelta === 0) {
-      await bot.sendMessage(chatId, `⚠️ No tracked GIDDY to sell (run buy first)`);
+    if (trackedGiddyDelta <= 0) {
+      await bot.sendMessage(chatId, `⚠️ No tracked GIDDY to sell (run buy first or invalid delta: ${trackedGiddyDelta.toFixed(2)})`);
       return;
     }
-    amount = trackedGiddyDelta * DECIMALS;
+    amount = Math.round(trackedGiddyDelta * DECIMALS); // Round to avoid invalid amounts
     if (inputBal < trackedGiddyDelta) {
       await bot.sendMessage(chatId, `⚠️ Tracked GIDDY (${trackedGiddyDelta.toFixed(2)}) > current balance (${inputBal.toFixed(2)})`);
       return;
@@ -150,13 +174,17 @@ bot.onText(/\/swap/, async (msg) => {
     console.log("✅ Txid:", txid);
     await decodeSwap(txid, chatId);
 
+    const mintToCheck = direction.from.equals(USDC_MINT) ? GIDDY_MINT : USDC_MINT;
+    const postBalance = await waitForBalanceChange(mintToCheck, preBalance, direction, chatId, quote);
+    const delta = postBalance - preBalance;
     if (direction.from.equals(USDC_MINT)) {
-      const postBalance = await waitForBalanceChange(GIDDY_MINT, preBalance, direction, chatId, quote);
-      trackedGiddyDelta = postBalance - preBalance;
+      trackedGiddyDelta = delta > 0 ? delta : (quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0);
+      trackedGiddyDelta = Number(trackedGiddyDelta.toFixed(6)); // Allow 6 decimals for precision
+      lastSwapOutAmount = quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0;
       console.log(`Tracked GIDDY delta from buy: ${trackedGiddyDelta.toFixed(2)}`);
     } else {
-      const postBalance = await waitForBalanceChange(USDC_MINT, balances.usdc, direction, chatId, quote);
       trackedGiddyDelta = 0;
+      lastSwapOutAmount = quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0;
     }
 
     currentPhase = currentPhase === "buy" ? "sell" : "buy";
@@ -196,7 +224,7 @@ bot.on("callback_query", async (query) => {
       await bot.sendMessage(chatId, `🛑 Insufficient SOL balance: ${balances.sol.toFixed(6)} SOL (min ${minSol} SOL)`);
       return;
     }
-    if (balances.usdc < minAmount) {
+    if (Number(balances.usdc.toFixed(2)) < minAmount) {
       await bot.sendMessage(chatId, `🛑 Minimum ${minAmount} USDC required.\nUSDC: ${balances.usdc.toFixed(2)}`);
       return;
     }
@@ -205,6 +233,7 @@ bot.on("callback_query", async (query) => {
     currentPhase = process.env.INITIAL_DIRECTION === 'backward' ? 'sell' : 'buy';
     swapLog = [];
     trackedGiddyDelta = 0;
+    lastSwapOutAmount = 0;
     await bot.sendMessage(chatId, `🔁 Swap loop started. Starting with: ${currentPhase === 'buy' ? 'USDC → GIDDY' : 'GIDDY → USDC'}`);
     console.log("🔁 Swap loop started. Phase:", currentPhase);
 
@@ -244,17 +273,17 @@ bot.on("callback_query", async (query) => {
       let skipReason = null;
       if (direction.from.equals(USDC_MINT)) {
         const maxBuy = Number(process.env.MAX_BUY_USDC || 10) * DECIMALS;
-        amount = Math.min(inputBalance * DECIMALS, maxBuy);
+        amount = lastSwapOutAmount > 0 ? Math.min(lastSwapOutAmount * DECIMALS, maxBuy) : Math.min(inputBalance * DECIMALS, maxBuy);
         if (amount < minThreshold * DECIMALS) {
-          skipReason = `Insufficient USDC for buy: ${inputBalance.toFixed(2)} (min ${minThreshold})`;
+          skipReason = `Insufficient USDC for buy: ${(amount / DECIMALS).toFixed(2)} (min ${minThreshold})`;
         }
       } else {
-        if (trackedGiddyDelta === 0) {
-          skipReason = `No tracked GIDDY to sell (run buy first)`;
+        if (trackedGiddyDelta <= 0) {
+          skipReason = `No tracked GIDDY to sell (run buy first or invalid delta: ${trackedGiddyDelta.toFixed(2)})`;
         } else {
-          amount = trackedGiddyDelta * DECIMALS;
+          amount = Math.round(trackedGiddyDelta * DECIMALS); // Round to avoid invalid amounts
           if (inputBalance < trackedGiddyDelta) {
-            skipReason = `Tracked GIDDY (${trackedGiddyDelta.toFixed(2)}) > current balance (${inputBalance.toFixed(2)})`;
+            skipReason = `Tracked GIDDY (${trackedGiddyDelta.toFixed(2)}) > current balance (${inputBal.toFixed(2)})`;
           }
         }
       }
@@ -278,8 +307,8 @@ bot.on("callback_query", async (query) => {
         const route = quote.router || (quote.routePlan?.map(step => step.swapInfo?.label || 'Unknown').join(' → ') || 'Unknown');
         const inTicker = direction.from.equals(USDC_MINT) ? 'USDC' : 'GIDDY';
         const outTicker = direction.to.equals(USDC_MINT) ? 'USDC' : 'GIDDY';
-        await bot.sendMessage(chatId, `📊 Ultra quote: ${(amount / DECIMALS).toFixed(2)} ${inTicker} → ~${(outAmount / DECIMALS).toFixed(2)} ${outTicker}\n🔀 Route: ${route}`);
-        console.log(`📊 Ultra quote: ${(amount / DECIMALS).toFixed(2)} ${inTicker} → ${(outAmount / DECIMALS).toFixed(2)} ${outTicker}`);
+        await bot.sendMessage(chatId, `📊 Quote: ${(amount / DECIMALS).toFixed(2)} ${inTicker} → ~${(outAmount / DECIMALS).toFixed(2)} ${outTicker}\n🔀 Route: ${route}`);
+        console.log(`📊 Quote: ${(amount / DECIMALS).toFixed(2)} ${inTicker} → ${(outAmount / DECIMALS).toFixed(2)} ${outTicker}`);
         console.log("🔀 Route:", route);
       }
 
@@ -293,10 +322,13 @@ bot.on("callback_query", async (query) => {
         const postBalance = await waitForBalanceChange(mintToCheck, preBalance, direction, chatId, quote);
         const delta = postBalance - preBalance;
         if (direction.from.equals(USDC_MINT)) {
-          trackedGiddyDelta = delta;
+          trackedGiddyDelta = delta > 0 ? delta : (quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0);
+          trackedGiddyDelta = Number(trackedGiddyDelta.toFixed(6)); // Allow 6 decimals for precision
+          lastSwapOutAmount = quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0;
           console.log(`Tracked GIDDY delta from buy: ${trackedGiddyDelta.toFixed(2)}`);
         } else {
           trackedGiddyDelta = 0;
+          lastSwapOutAmount = quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0;
         }
 
         const outAmount = quote ? (quote.outAmount || quote.totalOutputAmount || 0) : 0;
@@ -321,11 +353,10 @@ bot.on("callback_query", async (query) => {
           await new Promise(r => setTimeout(r, 5000));
           continue;
         }
-        await bot.sendMessage(chatId, `❌ Round ${round} failed after ${maxRetries} retries: ${error || "Unknown error."}`);
-        console.log(`❌ Round ${round} Failed after retries: ${error}`);
-        retryCount = 0;
-        currentPhase = currentPhase === "buy" ? "sell" : "buy";
-        await new Promise(r => setTimeout(r, 10000));
+        await bot.sendMessage(chatId, `⛔ Swap loop stopped due to repeated failures`);
+        console.log(`⛔ Swap loop stopped after ${maxRetries} retries: ${error}`);
+        isSwapping = false;
+        break;
       }
     }
 

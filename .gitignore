@@ -16,7 +16,8 @@ Thumbs.db
 .idea/
 
 # Keypairs (user-provided)
-*.json  # Or specific: mint-authority.json
+mint-authority.json  # Specify keypair files instead of *.json
+keypair.json
 
 # Builds/Tests
 dist/
