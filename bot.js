@@ -21,23 +21,47 @@ const DECIMALS = 1_000_000; // Both USDC & GIDDY have 6 decimals
 
 let cachedBalances = { usdc: 0, giddy: 0, sol: 0 };
 let lastBalanceCheck = 0;
+let cachedTokenAccounts = { usdc: null, giddy: null }; // Cache token account addresses
 
 async function getTokenBalance(mint) {
-  try {
-    const accounts = await connection.getTokenAccountsByOwner(wallet.publicKey, { mint });
-    if (accounts.value.length === 0) return 0;
-    const tokenProgram = mint.equals(GIDDY_MINT) ? TOKEN_2022_PROGRAM_ID : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-    const balance = await getAccount(connection, accounts.value[0].pubkey, 'confirmed', tokenProgram);
-    return Number(balance.amount);
-  } catch (err) {
-    console.error(`Balance fetch error for ${mint.toBase58()}: ${err.message}`);
-    return 0;
+  const maxRetries = 4;
+  let retryCount = 0;
+  const tokenProgram = mint.equals(GIDDY_MINT) ? TOKEN_2022_PROGRAM_ID : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+  const mintKey = mint.equals(USDC_MINT) ? 'usdc' : 'giddy';
+
+  while (retryCount < maxRetries) {
+    try {
+      let tokenAccount = cachedTokenAccounts[mintKey];
+      if (!tokenAccount) {
+        const accounts = await connection.getTokenAccountsByOwner(wallet.publicKey, { mint });
+        if (accounts.value.length === 0) return 0;
+        tokenAccount = accounts.value[0].pubkey;
+        cachedTokenAccounts[mintKey] = tokenAccount;
+        console.log(`🧩 Cached token account for ${mint.toBase58()}: ${tokenAccount.toBase58()}`);
+      }
+      const balance = await getAccount(connection, tokenAccount, 'confirmed', tokenProgram);
+      return Number(balance.amount);
+    } catch (err) {
+      if (err.message.includes('429 Too Many Requests')) {
+        retryCount++;
+        const delay = Math.pow(2, retryCount) * 500; // Exponential backoff: 500ms, 1000ms, 2000ms, 4000ms
+        console.log(`Server responded with 429 Too Many Requests. Retrying after ${delay}ms delay...`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      console.error(`Balance fetch error for ${mint.toBase58()}: ${err.message}`);
+      return 0;
+    }
   }
+  console.error(`Balance fetch failed for ${mint.toBase58()} after ${maxRetries} retries: 429 Too Many Requests`);
+  return 0;
 }
 
 export async function getBalances() {
   const now = Date.now();
-  if (now - lastBalanceCheck < 30000) return { ...cachedBalances, usdc: cachedBalances.usdc / DECIMALS, giddy: cachedBalances.giddy / DECIMALS, sol: cachedBalances.sol / LAMPORTS_PER_SOL };
+  if (now - lastBalanceCheck < 5000) { // Reduced cache duration to 5 seconds
+    return { ...cachedBalances, usdc: cachedBalances.usdc / DECIMALS, giddy: cachedBalances.giddy / DECIMALS, sol: cachedBalances.sol / LAMPORTS_PER_SOL };
+  }
 
   cachedBalances = {
     usdc: await getTokenBalance(USDC_MINT),
@@ -46,6 +70,11 @@ export async function getBalances() {
   };
   lastBalanceCheck = now;
   return { ...cachedBalances, usdc: cachedBalances.usdc / DECIMALS, giddy: cachedBalances.giddy / DECIMALS, sol: cachedBalances.sol / LAMPORTS_PER_SOL };
+}
+
+async function invalidateBalanceCache() {
+  lastBalanceCheck = 0; // Force fresh balance fetch on next getBalances call
+  console.log('🧹 Balance cache invalidated');
 }
 
 async function ensureATAs(inputMint, outputMint, chatId) {
@@ -146,6 +175,7 @@ async function executeUltra(quote, inputMint, outputMint, amountIn, timestamp, c
   if (chatId) await sendTelegram(chatId, `✅ Ultra swap success: ${amountIn / DECIMALS} ${inputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'} → ${quote.outAmount / DECIMALS} ${outputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'}`, txid);
 
   await logSwap({ timestamp, inputMint, outputMint, amountIn, amountOut: quote.outAmount, txid, route: quote.router, fallback: false });
+  await invalidateBalanceCache(); // Invalidate cache after successful swap
   return { txid, quote, error: null, timestamp, fallback: false };
 }
 
@@ -158,7 +188,7 @@ export async function ultraSwap(inputMint, outputMint, amountIn, chatId) {
   const balances = await getBalances();
   if (balances.sol < 0.005) throw new Error(`Insufficient SOL: ${balances.sol} (need 0.005)`);
   const inputBal = inputMint.equals(USDC_MINT) ? balances.usdc : balances.giddy;
-  if (inputBal < amountIn / DECIMALS) throw new Error(`Insufficient input: ${inputBal} (need ${amountIn / DECIMALS})`);
+  if (inputBal < amountIn / DECIMALS) throw new Error(`Insufficient input: ${inputBal.toFixed(6)} (need ${amountIn / DECIMALS})`);
 
   await ensureATAs(inputMint, outputMint, chatId);
 
@@ -174,24 +204,25 @@ export async function ultraSwap(inputMint, outputMint, amountIn, chatId) {
     }
   }
 
-  // Fallback to Jupiter
-  if (chatId) await sendTelegram(chatId, '⚠️ Ultra failed—trying Jupiter...');
-  const jupiterResult = await jupiterSwap(inputMint, outputMint, amountIn, timestamp, chatId);
-  if (jupiterResult.txid) return jupiterResult;
+  // Fallback to alternate routes
+  if (chatId) await sendTelegram(chatId, '⚠️ Ultra failed—checking alternate routes...');
+  const alternateResult = await jupiterSwap(inputMint, outputMint, amountIn, timestamp, chatId);
+  if (alternateResult.txid) return alternateResult;
 
   // Optional DLMM Fallback (set USE_DLMM_FALLBACK=true in .env to enable)
   if (process.env.USE_DLMM_FALLBACK === 'true') {
-    if (chatId) await sendTelegram(chatId, '⚠️ Jupiter failed—trying direct DLMM...');
+    if (chatId) await sendTelegram(chatId, '⚠️ Alternate routes failed—trying direct DLMM...');
     const dlmmResult = await dlmmSwap(wallet, connection, inputMint, outputMint, amountIn.toString());
     if (dlmmResult?.txid) {
       console.log(`✅ DLMM fallback executed: ${dlmmResult.txid}`);
       if (chatId) await sendTelegram(chatId, `✅ DLMM swap success: ${amountIn / DECIMALS} ${inputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'} → ${Number(dlmmResult.amountOut) / DECIMALS} ${outputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'}`, dlmmResult.txid);
       await logSwap({ timestamp, inputMint, outputMint, amountIn, amountOut: dlmmResult.amountOut, txid: dlmmResult.txid, route: 'Direct DLMM', fallback: true, dlmm: true });
+      await invalidateBalanceCache(); // Invalidate cache after successful swap
       return { txid: dlmmResult.txid, quote: null, error: null, timestamp, fallback: true, dlmm: true };
     }
   }
 
-  const error = 'All fallbacks failed';
+  const error = 'All alternate routes failed';
   await logSwap({ timestamp, inputMint, outputMint, amountIn, error });
   if (chatId) await sendTelegram(chatId, `❌ ${error}`);
   return { txid: null, quote: null, error, timestamp, fallback: false };
@@ -215,17 +246,17 @@ async function jupiterSwap(inputMint, outputMint, amountIn, timestamp, chatId) {
       });
       if (quote?.outAmount) break;
     } catch (err) {
-      console.error(`Jupiter quote attempt ${attempts + 1}: ${err.message}`);
+      console.error(`Alternate route attempt ${attempts + 1}: ${err.message}`);
     }
     attempts++;
     await new Promise(r => setTimeout(r, 500));
   }
 
-  if (!quote?.outAmount) throw new Error('No Jupiter quote available');
+  if (!quote?.outAmount) throw new Error('No quote available from alternate routes');
 
   const routeLabels = quote.routePlan?.map(step => step.swapInfo?.label || 'Unknown').join(' → ') || 'Direct';
-  console.log(`📊 Jupiter quote: ${amountIn / DECIMALS} → ~${quote.outAmount / DECIMALS} ${outputMint.equals(GIDDY_MINT) ? 'GIDDY' : 'USDC'}\n🔀 ${routeLabels}`);
-  if (chatId) await sendTelegram(chatId, `📊 Jupiter quote: ${amountIn / DECIMALS} ${inputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'} → ~${quote.outAmount / DECIMALS} ${outputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'}\n🔀 ${routeLabels}`);
+  console.log(`📊 Alternate route quote: ${amountIn / DECIMALS} → ~${quote.outAmount / DECIMALS} ${outputMint.equals(GIDDY_MINT) ? 'GIDDY' : 'USDC'}\n🔀 ${routeLabels}`);
+  if (chatId) await sendTelegram(chatId, `📊 Alternate route quote: ${amountIn / DECIMALS} ${inputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'} → ~${quote.outAmount / DECIMALS} ${outputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'}\n🔀 ${routeLabels}`);
 
   try {
     const swapRes = await api.swapPost({
@@ -245,13 +276,14 @@ async function jupiterSwap(inputMint, outputMint, amountIn, timestamp, chatId) {
     const txid = await connection.sendTransaction(vtx, { skipPreflight: false });
     await connection.confirmTransaction(txid, 'confirmed');
 
-    console.log(`✅ Jupiter executed: ${txid}`);
-    if (chatId) await sendTelegram(chatId, `✅ Jupiter swap success: ${amountIn / DECIMALS} ${inputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'} → ${quote.outAmount / DECIMALS} ${outputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'}\n🔀 ${routeLabels}`, txid);
+    console.log(`✅ Alternate route executed: ${txid}`);
+    if (chatId) await sendTelegram(chatId, `✅ Alternate route swap success: ${amountIn / DECIMALS} ${inputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'} → ${quote.outAmount / DECIMALS} ${outputMint.equals(USDC_MINT) ? 'USDC' : 'GIDDY'}\n🔀 ${routeLabels}`, txid);
 
     await logSwap({ timestamp, inputMint, outputMint, amountIn, amountOut: quote.outAmount, txid, route: routeLabels, fallback: true });
+    await invalidateBalanceCache(); // Invalidate cache after successful swap
     return { txid, quote, error: null, timestamp, fallback: true };
   } catch (err) {
-    const error = `Jupiter execution failed: ${err.message}`;
+    const error = `Alternate route execution failed: ${err.message}`;
     console.error(error);
     await logSwap({ timestamp, inputMint, outputMint, amountIn, error, fallback: true });
     if (chatId) await sendTelegram(chatId, `❌ ${error}`);

@@ -84,24 +84,27 @@ ${logs}
 
 async function waitForBalanceChange(mint, preBalance, direction, chatId, quote) {
   let postBalance = preBalance;
-  const maxAttempts = 10; // 20 seconds
+  const maxAttempts = 5; // 20 seconds
   let attempts = 0;
   const tokenLabel = mint.equals(GIDDY_MINT) ? 'GIDDY' : 'USDC';
   while (postBalance === preBalance && attempts < maxAttempts) {
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 4000)); // Increased delay to reduce RPC load
     const balances = await getBalances();
     postBalance = mint.equals(GIDDY_MINT) ? balances.giddy : balances.usdc;
     attempts++;
-    console.log(`Attempt ${attempts}: Waiting for ${tokenLabel} balance change after ${direction.label}... Current: ${postBalance.toFixed(2)}`);
+    console.log(`Attempt ${attempts}: Waiting for ${tokenLabel} balance change after ${direction.label}... Current: ${postBalance.toFixed(6)}`);
   }
-  const stopMessage = `🔄 Swaps in progress ♻️`;
+  const stopMessage = `⏳ Swaps in progress ♻️`;
   if (postBalance === preBalance) {
     const outAmount = (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS;
-    console.log(`⚠️ ${tokenLabel} balance did not change after ${direction.label} swap after ${maxAttempts} attempts. Using quote amount: ${outAmount.toFixed(2)}`);
+    console.log(`⚠️ ${tokenLabel} balance did not change after ${direction.label} swap after ${maxAttempts} attempts. Using quote amount: ${outAmount.toFixed(6)}`);
     console.log(stopMessage);
     await bot.sendMessage(chatId, stopMessage, {
       reply_markup: {
-        inline_keyboard: [[{ text: "Stop", callback_data: "stop" }]],
+        inline_keyboard: [
+          [{ text: "Stop", callback_data: "stop" }],
+          [{ text: "Main Menu", callback_data: "menu" }]
+        ],
       },
     });
     return outAmount; // Fallback to quote
@@ -109,7 +112,10 @@ async function waitForBalanceChange(mint, preBalance, direction, chatId, quote) 
   console.log(stopMessage);
   await bot.sendMessage(chatId, stopMessage, {
     reply_markup: {
-      inline_keyboard: [[{ text: "Stop", callback_data: "stop" }]],
+      inline_keyboard: [
+        [{ text: "Stop", callback_data: "stop" }],
+        [{ text: "Main Menu", callback_data: "menu" }]
+      ],
     },
   });
   return postBalance;
@@ -126,7 +132,10 @@ bot.onText(/\/swap/, async (msg) => {
   const minSol = 0.02;
 
   if (balances.sol < minSol) {
-    await bot.sendMessage(chatId, `🛑 Insufficient SOL balance: ${balances.sol.toFixed(6)} SOL (min ${minSol} SOL)`);
+    await bot.sendMessage(chatId, `
+🔴 *Insufficient Balance*
+• SOL: ${balances.sol.toFixed(6)} (Minimum: ${minSol.toFixed(6)} SOL)
+    `, { parse_mode: "Markdown" });
     return;
   }
 
@@ -134,37 +143,51 @@ bot.onText(/\/swap/, async (msg) => {
     ? { from: USDC_MINT, to: GIDDY_MINT, label: "USDC → GIDDY" }
     : { from: GIDDY_MINT, to: USDC_MINT, label: "GIDDY → USDC" };
 
-  const inputBal = direction.from.equals(USDC_MINT) ? balances.usdc : balances.giddy;
+  const inputBalance = direction.from.equals(USDC_MINT) ? balances.usdc : balances.giddy;
   let amount;
   let preBalance = balances.giddy;
   if (direction.from.equals(USDC_MINT)) {
     const maxBuy = Number(process.env.MAX_BUY_USDC || 10) * DECIMALS;
-    amount = lastSwapOutAmount > 0 ? Math.min(lastSwapOutAmount * DECIMALS, maxBuy) : Math.min(inputBal * DECIMALS, maxBuy);
+    amount = lastSwapOutAmount > 0 ? Math.min(lastSwapOutAmount * DECIMALS, maxBuy) : Math.min(inputBalance * DECIMALS, maxBuy);
     if (amount < Number(process.env.MIN_SWAP_AMOUNT) * DECIMALS) {
-      await bot.sendMessage(chatId, `🛑 Insufficient USDC for buy: ${inputBal.toFixed(2)} (min ${process.env.MIN_SWAP_AMOUNT})`);
+      await bot.sendMessage(chatId, `
+🔴 *Insufficient Balance*
+• USDC: ${inputBalance.toFixed(6)} (Minimum: ${Number(process.env.MIN_SWAP_AMOUNT).toFixed(6)} USDC)
+      `, { parse_mode: "Markdown" });
       return;
     }
   } else {
     if (trackedGiddyDelta <= 0) {
-      await bot.sendMessage(chatId, `⚠️ No tracked GIDDY to sell (run buy first or invalid delta: ${trackedGiddyDelta.toFixed(2)})`);
+      await bot.sendMessage(chatId, `⚠️ No tracked GIDDY to sell (run buy first or invalid delta: ${trackedGiddyDelta.toFixed(6)})`);
       return;
     }
-    amount = Math.round(trackedGiddyDelta * DECIMALS); // Round to avoid invalid amounts
-    if (inputBal < trackedGiddyDelta) {
-      await bot.sendMessage(chatId, `⚠️ Tracked GIDDY (${trackedGiddyDelta.toFixed(2)}) > current balance (${inputBal.toFixed(2)})`);
+    console.log(`Sell phase - Input balance: ${inputBalance.toFixed(6)}, Tracked GIDDY delta: ${trackedGiddyDelta.toFixed(6)}`);
+    amount = Math.round(trackedGiddyDelta * DECIMALS); // Use full trackedGiddyDelta
+    if (inputBalance < trackedGiddyDelta) {
+      await bot.sendMessage(chatId, `
+🔴 *Insufficient Balance*
+• GIDDY: ${inputBalance.toFixed(6)} (Required: ${trackedGiddyDelta.toFixed(6)} GIDDY)
+      `, { parse_mode: "Markdown" });
       return;
     }
   }
 
-  const { txid, quote, error, fallback, dlmm } = await ultraSwap(direction.from, direction.to, amount, chatId);
+  let txid, quote, error, fallback, dlmm;
+  try {
+    ({ txid, quote, error, fallback, dlmm } = await ultraSwap(direction.from, direction.to, amount, chatId));
+  } catch (err) {
+    await bot.sendMessage(chatId, `❌ Swap failed: Failed to fetch quote from alternate routes: ${err.message}`);
+    console.log(`❌ Swap failed: ${err.message}`);
+    return;
+  }
 
   if (quote) {
     const outAmount = quote.outAmount || quote.totalOutputAmount || 'N/A';
     const route = quote.router || (quote.routePlan?.map(step => step.swapInfo?.label || 'Unknown').join(' → ') || 'Unknown');
     const inTicker = direction.from.equals(USDC_MINT) ? 'USDC' : 'GIDDY';
     const outTicker = direction.to.equals(USDC_MINT) ? 'USDC' : 'GIDDY';
-    await bot.sendMessage(chatId, `📊 Quote: ${(amount / DECIMALS).toFixed(2)} ${inTicker} → ~${(outAmount / DECIMALS).toFixed(2)} ${outTicker}\n🔀 Route: ${route}`);
-    console.log(`📊 Quote: ${(amount / DECIMALS).toFixed(2)} ${inTicker} → ${(outAmount / DECIMALS).toFixed(2)} ${outTicker}`);
+    await bot.sendMessage(chatId, `📊 Quote: ${(amount / DECIMALS).toFixed(6)} ${inTicker} → ~${(outAmount / DECIMALS).toFixed(6)} ${outTicker}\n🔀 Route: ${route}`);
+    console.log(`📊 Quote: ${(amount / DECIMALS).toFixed(6)} ${inTicker} → ${(outAmount / DECIMALS).toFixed(6)} ${outTicker}`);
     console.log("🔀 Route:", route);
   }
 
@@ -178,13 +201,17 @@ bot.onText(/\/swap/, async (msg) => {
     const postBalance = await waitForBalanceChange(mintToCheck, preBalance, direction, chatId, quote);
     const delta = postBalance - preBalance;
     if (direction.from.equals(USDC_MINT)) {
+      console.log(`Pre-buy trackedGiddyDelta: ${trackedGiddyDelta.toFixed(6)}`);
       trackedGiddyDelta = delta > 0 ? delta : (quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0);
+      console.log(`Post-buy trackedGiddyDelta: ${trackedGiddyDelta.toFixed(6)}`);
       trackedGiddyDelta = Number(trackedGiddyDelta.toFixed(6)); // Allow 6 decimals for precision
       lastSwapOutAmount = quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0;
       console.log(`Tracked GIDDY delta from buy: ${trackedGiddyDelta.toFixed(2)}`);
     } else {
+      console.log(`Pre-sell trackedGiddyDelta: ${trackedGiddyDelta.toFixed(6)}`);
       trackedGiddyDelta = 0;
       lastSwapOutAmount = quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0;
+      console.log(`Post-sell trackedGiddyDelta: ${trackedGiddyDelta.toFixed(6)}`);
     }
 
     currentPhase = currentPhase === "buy" ? "sell" : "buy";
@@ -200,32 +227,62 @@ bot.on("callback_query", async (query) => {
   await bot.answerCallbackQuery(query.id);
 
   if (action === "deposit") {
-    await bot.sendMessage(chatId, `Send Minimum $10 USDC to:\n\n\`${wallet.publicKey.toBase58()}\`\n\nATA: Check your wallet for USDC ATA.`, {
+    await bot.sendMessage(chatId, `
+💸 *Balance Required*
+• Minimum: 10.000000 USDC
+• Send to: \`${wallet.publicKey.toBase58()}\`
+• Check your wallet for USDC ATA
+🔗 [View Portfolio on Solscan](https://solscan.io/account/${wallet.publicKey.toBase58()}#portfolio)
+    `, {
       parse_mode: "Markdown",
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "Check Balance", callback_data: "balance" }]
+        ],
+      },
     });
   }
 
   if (action === "balance") {
     const balances = await getBalances();
-    await bot.sendMessage(chatId, `Current Balances:\n💵 USDC: ${balances.usdc.toFixed(2)}\n🎢 GIDDY: ${balances.giddy.toFixed(2)}\n☀️ SOL: ${balances.sol.toFixed(6)}`);
-    console.log("📊 Balances:", balances.usdc.toFixed(2), "USDC,", balances.giddy.toFixed(2), "GIDDY,", balances.sol.toFixed(6), "SOL");
+    await bot.sendMessage(chatId, `
+📊 *Current Balances*
+• 💵 USDC: ${balances.usdc.toFixed(6)}
+• 🎢 GIDDY: ${balances.giddy.toFixed(6)}
+• ☀️ SOL: ${balances.sol.toFixed(6)}
+    `, { parse_mode: "Markdown" });
+    console.log("📊 Balances:", balances.usdc.toFixed(6), "USDC,", balances.giddy.toFixed(6), "GIDDY,", balances.sol.toFixed(6), "SOL");
+  }
+
+  if (action === "menu") {
+    await bot.sendMessage(chatId, "Welcome to GIDDY_SWAP_BOT 👋 Choose an action:", menu);
   }
 
   if (action === "start") {
     if (isSwapping) {
-      await bot.sendMessage(chatId, "Swap loop is already running.");
+      await bot.sendMessage(chatId, "ℹ️ Swap loop is already running.");
       return;
     }
 
     const balances = await getBalances();
     const minAmount = Number(process.env.INITIAL_AMOUNT) || 10;
     const minSol = 0.02;
+    const insufficientBalances = [];
+
     if (balances.sol < minSol) {
-      await bot.sendMessage(chatId, `🛑 Insufficient SOL balance: ${balances.sol.toFixed(6)} SOL (min ${minSol} SOL)`);
-      return;
+      insufficientBalances.push(`• SOL: ${balances.sol.toFixed(6)} (Minimum: ${minSol.toFixed(6)} SOL)`);
     }
     if (Number(balances.usdc.toFixed(2)) < minAmount) {
-      await bot.sendMessage(chatId, `🛑 Minimum ${minAmount} USDC required.\nUSDC: ${balances.usdc.toFixed(2)}`);
+      insufficientBalances.push(`• USDC: ${balances.usdc.toFixed(6)} (Minimum: ${minAmount.toFixed(6)} USDC)`);
+    }
+
+    if (insufficientBalances.length > 0) {
+      await bot.sendMessage(chatId, `
+🔴 *Insufficient Balance*
+${insufficientBalances.join('\n')}
+      `, { parse_mode: "Markdown" });
+      console.log(`🛑 Swap loop cannot start: ${insufficientBalances.join(', ')}`);
       return;
     }
 
@@ -248,17 +305,37 @@ bot.on("callback_query", async (query) => {
       const minSol = 0.02;
 
       if (balances.sol < minSol) {
-        const reason = `SOL balance below threshold: ${balances.sol.toFixed(6)} SOL (min ${minSol} SOL)`;
-        await bot.sendMessage(chatId, `🛑 Swap loop stopped. ${reason}`);
-        console.log("🛑 Swap loop stopped. SOL:", balances.sol.toFixed(6));
+        await bot.sendMessage(chatId, `
+🔴 *Insufficient Balance*
+• SOL: ${balances.sol.toFixed(6)} (Minimum: ${minSol.toFixed(6)} SOL)
+        `, {
+          parse_mode: "Markdown",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "💰 Deposit", callback_data: "deposit" }],
+              [{ text: "Main Menu", callback_data: "menu" }]
+            ],
+          },
+        });
+        console.log("⛔ Swap loop stopped. SOL:", balances.sol.toFixed(6));
         isSwapping = false;
         break;
       }
 
       if (currentPhase === 'buy' && balances.usdc < minThreshold) {
-        const reason = `USDC balance below threshold before buy: ${balances.usdc.toFixed(2)} (min ${minThreshold})`;
-        await bot.sendMessage(chatId, `🛑 Swap loop stopped. ${reason}`);
-        console.log("🛑 Swap loop stopped. USDC pre-buy:", balances.usdc.toFixed(2));
+        await bot.sendMessage(chatId, `
+🔴 *Insufficient Balance*
+• USDC: ${balances.usdc.toFixed(6)} (Minimum: ${minThreshold.toFixed(6)} USDC)
+        `, {
+          parse_mode: "Markdown",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "💰 Deposit", callback_data: "deposit" }],
+              [{ text: "Main Menu", callback_data: "menu" }]
+            ],
+          },
+        });
+        console.log("⛔ Swap loop stopped. USDC pre-buy:", balances.usdc.toFixed(6));
         isSwapping = false;
         break;
       }
@@ -275,15 +352,16 @@ bot.on("callback_query", async (query) => {
         const maxBuy = Number(process.env.MAX_BUY_USDC || 10) * DECIMALS;
         amount = lastSwapOutAmount > 0 ? Math.min(lastSwapOutAmount * DECIMALS, maxBuy) : Math.min(inputBalance * DECIMALS, maxBuy);
         if (amount < minThreshold * DECIMALS) {
-          skipReason = `Insufficient USDC for buy: ${(amount / DECIMALS).toFixed(2)} (min ${minThreshold})`;
+          skipReason = `Insufficient USDC for buy: ${inputBalance.toFixed(6)} (min ${minThreshold})`;
         }
       } else {
         if (trackedGiddyDelta <= 0) {
-          skipReason = `No tracked GIDDY to sell (run buy first or invalid delta: ${trackedGiddyDelta.toFixed(2)})`;
+          skipReason = `No tracked GIDDY to sell (run buy first or invalid delta: ${trackedGiddyDelta.toFixed(6)})`;
         } else {
-          amount = Math.round(trackedGiddyDelta * DECIMALS); // Round to avoid invalid amounts
+          console.log(`Sell phase - Input balance: ${inputBalance.toFixed(6)}, Tracked GIDDY delta: ${trackedGiddyDelta.toFixed(6)}`);
+          amount = Math.round(trackedGiddyDelta * DECIMALS); // Use full trackedGiddyDelta
           if (inputBalance < trackedGiddyDelta) {
-            skipReason = `Tracked GIDDY (${trackedGiddyDelta.toFixed(2)}) > current balance (${inputBal.toFixed(2)})`;
+            skipReason = `Insufficient GIDDY balance: ${inputBalance.toFixed(6)} < ${trackedGiddyDelta.toFixed(6)}`;
           }
         }
       }
@@ -297,18 +375,47 @@ bot.on("callback_query", async (query) => {
       }
 
       await bot.sendMessage(chatId, `🔁 Round ${round}: ${direction.label}\n⏳ ${new Date().toLocaleTimeString()}`);
-      console.log(`🔁 Round ${round}: ${direction.label} (${(amount / DECIMALS).toFixed(2)})`);
+      console.log(`🔁 Round ${round}: ${direction.label} (${(amount / DECIMALS).toFixed(6)})`);
 
       const prevAmount = inputBalance * DECIMALS;
-      const { txid, quote, error, fallback, dlmm } = await ultraSwap(direction.from, direction.to, amount, chatId);
+      let txid, quote, error, fallback, dlmm;
+      try {
+        ({ txid, quote, error, fallback, dlmm } = await ultraSwap(direction.from, direction.to, amount, chatId));
+      } catch (err) {
+        if (err.message.includes('Insufficient input')) {
+          const match = err.message.match(/Insufficient input: (\d+\.\d+) \(need (\d+\.\d+)\)/);
+          const currentBalance = match ? parseFloat(match[1]) : inputBalance;
+          const requiredBalance = match ? parseFloat(match[2]) : amount / DECIMALS;
+          await bot.sendMessage(chatId, `
+🔴 *Insufficient Balance*
+• USDC: ${currentBalance.toFixed(6)} (Minimum: ${requiredBalance.toFixed(6)} USDC)
+• Balance reduction occurred during swap cycle
+          `, {
+            parse_mode: "Markdown",
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "💰 Deposit", callback_data: "deposit" }],
+                [{ text: "Main Menu", callback_data: "menu" }]
+              ],
+            },
+          });
+          console.log(`⛔ Swap loop stopped. USDC: ${currentBalance.toFixed(6)} (need ${requiredBalance.toFixed(6)})`);
+          isSwapping = false;
+          break;
+        }
+        await bot.sendMessage(chatId, `❌ Swap failed: Failed to fetch quote from alternate routes: ${err.message}`);
+        console.log(`❌ Swap failed: ${err.message}`);
+        isSwapping = false;
+        break;
+      }
 
       if (quote) {
         const outAmount = quote.outAmount || quote.totalOutputAmount || 'N/A';
         const route = quote.router || (quote.routePlan?.map(step => step.swapInfo?.label || 'Unknown').join(' → ') || 'Unknown');
         const inTicker = direction.from.equals(USDC_MINT) ? 'USDC' : 'GIDDY';
         const outTicker = direction.to.equals(USDC_MINT) ? 'USDC' : 'GIDDY';
-        await bot.sendMessage(chatId, `📊 Quote: ${(amount / DECIMALS).toFixed(2)} ${inTicker} → ~${(outAmount / DECIMALS).toFixed(2)} ${outTicker}\n🔀 Route: ${route}`);
-        console.log(`📊 Quote: ${(amount / DECIMALS).toFixed(2)} ${inTicker} → ${(outAmount / DECIMALS).toFixed(2)} ${outTicker}`);
+        await bot.sendMessage(chatId, `📊 Quote: ${(amount / DECIMALS).toFixed(6)} ${inTicker} → ~${(outAmount / DECIMALS).toFixed(6)} ${outTicker}\n🔀 Route: ${route}`);
+        console.log(`📊 Quote: ${(amount / DECIMALS).toFixed(6)} ${inTicker} → ${(outAmount / DECIMALS).toFixed(6)} ${outTicker}`);
         console.log("🔀 Route:", route);
       }
 
@@ -322,13 +429,17 @@ bot.on("callback_query", async (query) => {
         const postBalance = await waitForBalanceChange(mintToCheck, preBalance, direction, chatId, quote);
         const delta = postBalance - preBalance;
         if (direction.from.equals(USDC_MINT)) {
+          console.log(`Pre-buy trackedGiddyDelta: ${trackedGiddyDelta.toFixed(6)}`);
           trackedGiddyDelta = delta > 0 ? delta : (quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0);
+          console.log(`Post-buy trackedGiddyDelta: ${trackedGiddyDelta.toFixed(6)}`);
           trackedGiddyDelta = Number(trackedGiddyDelta.toFixed(6)); // Allow 6 decimals for precision
           lastSwapOutAmount = quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0;
           console.log(`Tracked GIDDY delta from buy: ${trackedGiddyDelta.toFixed(2)}`);
         } else {
+          console.log(`Pre-sell trackedGiddyDelta: ${trackedGiddyDelta.toFixed(6)}`);
           trackedGiddyDelta = 0;
           lastSwapOutAmount = quote ? (quote.outAmount || quote.totalOutputAmount || 0) / DECIMALS : 0;
+          console.log(`Post-sell trackedGiddyDelta: ${trackedGiddyDelta.toFixed(6)}`);
         }
 
         const outAmount = quote ? (quote.outAmount || quote.totalOutputAmount || 0) : 0;
@@ -336,8 +447,8 @@ bot.on("callback_query", async (query) => {
         swapLog.push({
           round,
           direction: currentPhase,
-          amountIn: (amount / DECIMALS).toFixed(2),
-          amountOut: (outAmount / DECIMALS).toFixed(2),
+          amountIn: (amount / DECIMALS).toFixed(6),
+          amountOut: (outAmount / DECIMALS).toFixed(6),
           loss: (loss / DECIMALS).toFixed(6),
           txid
         });
@@ -348,12 +459,12 @@ bot.on("callback_query", async (query) => {
       } else {
         if (retryCount < maxRetries) {
           retryCount++;
-          await bot.sendMessage(chatId, `⚠️ Round ${round} failed, retrying (${retryCount}/${maxRetries})...\nError: ${error || 'Unknown'}`);
+          await bot.sendMessage(chatId, `⚠️ Round ${round} failed, retrying (${retryCount}/${maxRetries})...\nError: Failed to fetch quote from alternate routes: ${error || 'Unknown'}`);
           console.log(`⚠️ Round ${round} Retry ${retryCount}/${maxRetries}: ${error}`);
           await new Promise(r => setTimeout(r, 5000));
           continue;
         }
-        await bot.sendMessage(chatId, `⛔ Swap loop stopped due to repeated failures`);
+        await bot.sendMessage(chatId, `⛔ Swap loop stopped due to repeated failures: Failed to fetch quote from alternate routes`);
         console.log(`⛔ Swap loop stopped after ${maxRetries} retries: ${error}`);
         isSwapping = false;
         break;
