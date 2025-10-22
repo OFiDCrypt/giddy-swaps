@@ -5,6 +5,11 @@ node_modules/
 .env
 *.env
 
+# User Data (privacy)
+chats/
+userData.json
+companyData.js
+
 # Logs
 swaps/
 *.log
